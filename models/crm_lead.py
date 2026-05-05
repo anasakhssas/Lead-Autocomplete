@@ -30,12 +30,10 @@ class CrmLead(models.Model):
         if not groq_key:
             raise UserError(_(
                 "Groq API key is not configured. "
-                "Go to Settings → Lead Auto-Fill to add it."
             ))
         if not tavily_key:
             raise UserError(_(
                 "Tavily API key is not configured. "
-                "Go to Settings → Lead Auto-Fill to add it."
             ))
 
         context = self._build_search_context()
