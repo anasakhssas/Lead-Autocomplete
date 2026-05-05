@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<odoo>
+    <record id="res_config_settings_view_form_autofill" model="ir.ui.view">
+        <field name="name">res.config.settings.view.form.autofill</field>
+        <field name="model">res.config.settings</field>
+        <field name="inherit_id" ref="base_setup.res_config_settings_view_form"/>
+        <field name="arch" type="xml">
+            <xpath expr="//div[@id='sales']" position="after">
+                <app string="Lead Auto-Fill" name="lead_autofill">
+                    <block title="AI Configuration">
+                        <setting string="Groq API Key"
+                                 help="Free LLM inference — get your key at console.groq.com">
+                            <field name="lead_autofill_groq_api_key"
+                                   password="True"
+                                   placeholder="gsk_..."/>
+                        </setting>
+                        <setting string="Tavily API Key"
+                                 help="AI-powered web search — free tier: 1 000 req/month. Get your key at app.tavily.com">
+                            <field name="lead_autofill_tavily_api_key"
+                                   password="True"
+                                   placeholder="tvly-..."/>
+                        </setting>
+                    </block>
+                </app>
+            </xpath>
+        </field>
+    </record>
+</odoo>
