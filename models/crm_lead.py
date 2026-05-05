@@ -48,45 +48,8 @@ class CrmLead(models.Model):
 
         _logger.debug("Fields to fill: %s", fields_to_fill)
 
-        # ── Gather rich content via Tavily ─────────────────────────────
-
-        content_parts = []
-
-        # QUERY 1 — General contact / address info
-        main_query = self._build_query(context, intent="address")
-        _logger.info("Tavily main query: %s", main_query)
-        result = self._tavily_search(main_query, tavily_key, depth="advanced")
-        if result:
-            content_parts.append(result)
-
-        # QUERY 2 — Dedicated phone search (only if phone is missing)
-        if "phone" in fields_to_fill:
-            phone_query = self._build_query(context, intent="phone")
-            _logger.info("Tavily phone query: %s", phone_query)
-            result = self._tavily_search(phone_query, tavily_key, depth="basic")
-            if result:
-                content_parts.append(result)
-
-        # QUERY 3 — Official website discovery (only if website is missing)
-        if "website" in fields_to_fill and context.get("company_name"):
-            site_query = self._build_query(context, intent="website")
-            _logger.info("Tavily website query: %s", site_query)
-            result = self._tavily_search(
-                site_query, tavily_key, depth="basic",
-                include_domains=[],      # no restriction — let Tavily find the homepage
-                max_results=3,
-            )
-            if result:
-                content_parts.append(result)
-
-        if not content_parts:
-            return self._notify("Could not retrieve any information from Tavily.", "warning")
-
-        combined = "\n\n".join(content_parts)
-        _logger.debug("Total Tavily content: %d chars", len(combined))
-
-        # ── AI extraction ──────────────────────────────────────────────
-        extracted = self._extract_with_groq(combined, context, fields_to_fill, groq_key)
+        # ── AI Agentic Extraction (Groq + Tavily) ────────────────────────
+        extracted = self._agentic_extractor(context, fields_to_fill, groq_key, tavily_key)
         if not extracted:
             return self._notify("AI could not extract any data.", "warning")
 
@@ -107,21 +70,14 @@ class CrmLead(models.Model):
         include_domains: list | None = None,
     ) -> str:
         """
-        Call the Tavily Search API and return a single clean text block
-        ready to feed to Groq.
-
-        Tavily already extracts clean text from each page — no HTML parsing
-        needed.  'advanced' depth triggers full-page crawling; 'basic' is
-        faster and cheaper (counts as 1 API credit vs 2 for advanced).
-
-        Returns an empty string on failure (non-fatal — we just skip this source).
+        Call the Tavily Search API and return a single clean text block.
         """
         payload = {
             "api_key":        api_key,
             "query":          query,
-            "search_depth":   depth,          # "basic" | "advanced"
-            "include_answer": True,           # Tavily's own AI-synthesised summary
-            "include_raw_content": False,     # clean content is sufficient
+            "search_depth":   depth,
+            "include_answer": True,
+            "include_raw_content": False,
             "max_results":    max_results,
         }
         if include_domains is not None:
@@ -141,13 +97,10 @@ class CrmLead(models.Model):
             return ""
 
         parts = []
-
-        # 1. Tavily's own AI-generated answer (very concise, high signal)
         answer = (data.get("answer") or "").strip()
         if answer:
             parts.append(f"[Tavily summary]\n{answer}")
 
-        # 2. Individual result snippets with their source URL
         for item in data.get("results", []):
             title   = (item.get("title")   or "").strip()
             content = (item.get("content") or "").strip()
@@ -186,43 +139,21 @@ class CrmLead(models.Model):
         }
         return [f for f, v in candidates.items() if not v]
 
-    def _build_query(self, context: dict, intent: str = "address") -> str:
-        """
-        Build a targeted Tavily query.
-
-        intent = 'address' → full contact details (street, zip, city)
-        intent = 'phone'   → phone number
-        intent = 'website' → official website URL
-        """
-        company = context.get("company_name", "")
-        city    = context.get("city", "")
-        country = context.get("country", "")
-
-        base = f'"{company}"' if company else ""
-        if city:
-            base += f" {city}"
-        if country:
-            base += f" {country}"
-
-        suffix = {
-            "address": "headquarters address contact",
-            "phone":   "phone number",
-            "website": "official website",
-        }.get(intent, "contact")
-
-        return f"{base} {suffix}".strip()
-
     # ------------------------------------------------------------------
-    # Groq AI extraction
+    # Groq AI Agentic Extraction
     # ------------------------------------------------------------------
 
-    def _extract_with_groq(
+    def _agentic_extractor(
         self,
-        content: str,
         context: dict,
         fields_to_fill: list,
-        api_key: str,
+        groq_api_key: str,
+        tavily_api_key: str,
     ) -> dict | None:
+        """
+        Agentic loop: Groq determines which searches to perform using Tavily,
+        processes the retrieved text, and returns the final JSON.
+        """
         field_descriptions = {
             "street":  "street address line 1 (e.g. '10 Rue de la Paix')",
             "street2": "address complement (suite / floor / building)",
@@ -234,15 +165,16 @@ class CrmLead(models.Model):
         requested = {f: field_descriptions[f] for f in fields_to_fill if f in field_descriptions}
 
         system_prompt = (
-            "You are a precise data-extraction assistant. "
-            "Extract ONLY the requested fields from the web content provided. "
-            "Reply with a SINGLE valid JSON object, nothing else. "
-            "Set a field to null if you cannot find it with high confidence. "
-            "Never invent or guess data."
+            "You are an autonomous web-search agent. Your task is to find missing information "
+            "for a company based on the provided context.\n"
+            "You have access to a 'web_search' tool. Use it to search for the missing fields.\n"
+            "IMPORTANT: Once you have found the requested fields or determined they cannot be found, "
+            "your FINAL response must be ONLY a valid JSON object matching the requested fields precisely.\n"
+            "Set a field to null if you cannot find it. Never invent data."
         )
 
         user_prompt = f"""
-=== Company context ===
+=== Company Context ===
 Name    : {context['company_name']  or 'unknown'}
 Contact : {context['contact_name'] or 'unknown'}
 City    : {context['city']          or 'unknown'}
@@ -250,60 +182,111 @@ Country : {context['country']       or 'unknown'}
 Website : {context['website']       or 'unknown'}
 Email   : {context['email']         or 'unknown'}
 
-=== Web content (from Tavily — already cleaned and extracted) ===
-{content[:7_000]}
-
-=== Task ===
-From the content above, extract exactly these fields.
-Return ONLY a valid JSON object with these keys:
+=== Missing Fields to Find ===
 {json.dumps(requested, indent=2, ensure_ascii=False)}
 
-Example:
-{{
-  "street": "10 Rue de la Paix",
-  "zip": "75001",
-  "city": "Paris",
-  "phone": "+33 1 42 00 00 00",
-  "website": "https://example.fr"
-}}
+If you have enough information right now, output the final JSON. 
+If not, use the `web_search` tool to gather data.
 """
 
-        try:
-            resp = requests.post(
-                GROQ_API_URL,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type":  "application/json",
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "web_search",
+                    "description": "Search the web for company information, addresses, phones, etc.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "The search query (e.g. 'OpenAI headquarters address')",
+                            }
+                        },
+                        "required": ["query"],
+                    },
                 },
-                json={
-                    "model":    GROQ_MODEL,
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user",   "content": user_prompt},
-                    ],
-                    "temperature": 0.0,
-                    "max_tokens":  400,
-                },
-                timeout=25,
-            )
-            resp.raise_for_status()
-        except requests.RequestException as exc:
-            _logger.error("Groq API call failed: %s", exc)
-            return None
+            }
+        ]
 
-        raw = resp.json()["choices"][0]["message"]["content"].strip()
+        # Start the Agentic Loop (max 4 turns)
+        for turn in range(4):
+            _logger.info("Agentic turn %d...", turn + 1)
+            try:
+                resp = requests.post(
+                    GROQ_API_URL,
+                    headers={
+                        "Authorization": f"Bearer {groq_api_key}",
+                        "Content-Type":  "application/json",
+                    },
+                    json={
+                        "model": GROQ_MODEL,
+                        "messages": messages,
+                        "tools": tools,
+                        "tool_choice": "auto",
+                        "temperature": 0.0,
+                        "max_tokens": 800,
+                    },
+                    timeout=30,
+                )
+                resp.raise_for_status()
+            except requests.RequestException as exc:
+                _logger.error("Groq API call failed: %s", exc)
+                return None
 
-        # Strip markdown code fences if the model wraps its output
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
+            response_data = resp.json()["choices"][0]["message"]
+            messages.append(response_data)
 
-        try:
-            return json.loads(raw.strip())
-        except json.JSONDecodeError:
-            _logger.error("Could not parse Groq response as JSON:\n%s", raw)
-            return None
+            # Check if the model wants to call a tool
+            if response_data.get("tool_calls"):
+                for tool_call in response_data["tool_calls"]:
+                    if tool_call["function"]["name"] == "web_search":
+                        try:
+                            args = json.loads(tool_call["function"]["arguments"])
+                            query = args.get("query", "")
+                        except json.JSONDecodeError:
+                            query = ""
+
+                        _logger.info("Groq is calling web_search with query: '%s'", query)
+                        
+                        search_result = self._tavily_search(query, tavily_api_key, depth="basic", max_results=3)
+                        if not search_result:
+                            search_result = "No results found."
+                            
+                        # Add tool result back to the conversation
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call["id"],
+                            "name": "web_search",
+                            "content": search_result[:4000] # limit length to save tokens
+                        })
+                
+                # Continue loop so the model can process the tool results
+                continue
+            
+            # If no tool calls, it should be the final output
+            raw = response_data.get("content", "").strip()
+            
+            # Clean possible markdown wrap
+            if raw.startswith("```"):
+                raw = raw.split("```")[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+
+            try:
+                final_json = json.loads(raw)
+                return final_json
+            except json.JSONDecodeError:
+                _logger.error("Agent returned invalid JSON at end of logic: %s", raw)
+                return None
+
+        _logger.warning("Agent exceeded maximum turns")
+        return None
 
     # ------------------------------------------------------------------
     # Apply results
