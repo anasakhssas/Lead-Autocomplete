@@ -5,6 +5,7 @@ Petit module Odoo pour aider à compléter automatiquement une piste CRM.
 L'idée est simple: quand une fiche prospect est incomplète, le module essaie de retrouver quelques informations utiles sur le web, puis propose de remplir les champs manquants à votre place. On garde donc un vrai gain de temps, sans perdre le contrôle sur ce qui est écrit dans la fiche.
 
 Il ajoute un bouton **Auto-fill** sur la fiche prospect. Quand on le lance, le module cherche des infos utiles sur l’entreprise ou le contact, puis essaie de remplir les champs manquants à partir de ces données.
+Quand seul le nom du contact est présent, il tente aussi d’identifier l’entreprise associée, puis réutilise ce nom d’entreprise pour enrichir la fiche société.
 
 ## Fonctions principales
 

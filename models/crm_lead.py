@@ -45,6 +45,27 @@ class CrmLead(models.Model):
                 "Cannot auto-fill: at least a company name or contact name is required."
             ))
 
+        if not company_name and contact_name:
+            inferred_company_name = self._infer_company_name_from_contact(
+                contact_name=contact_name,
+                contact_email_hint=contact_email_hint,
+                city_hint=city_hint,
+                groq_key=groq_key,
+                tavily_key=tavily_key,
+            )
+            if inferred_company_name:
+                company_name = inferred_company_name
+                self._apply_extracted_data(
+                    {"company_name": inferred_company_name},
+                    company_name="",
+                    write_phone=False,
+                )
+                _logger.info(
+                    "Auto-fill inferred company name %s for lead %s",
+                    inferred_company_name,
+                    self.id,
+                )
+
         company_fields = self._get_company_missing_fields() if company_name else []
         contact_fields = self._get_contact_missing_fields() if contact_name else []
 
@@ -175,6 +196,11 @@ class CrmLead(models.Model):
         """
         cf_desc = {f: self._company_field_desc()[f] for f in company_fields}
         kf_desc = {f: self._contact_field_desc()[f]  for f in contact_fields}
+        morocco_queries = self._morocco_company_location_queries(
+            company_name=company_name,
+            company_fields=company_fields,
+            city_hint=city_hint,
+        )
 
         prompt = f"""
             You are a search-query planner for a CRM enrichment tool.
@@ -191,8 +217,13 @@ class CrmLead(models.Model):
             Generate the MINIMUM number of targeted web-search queries (max 5) needed
             to find the missing fields above. Prefer queries that combine the company
             name with a specific intent (e.g. "address", "phone", "contact email").
+            For company street or city searches, prioritize Morocco-first queries when
+            the company may have an office there.
             For contact fields always include the company name for precision.
             If an email is available, include it in contact queries too.
+
+            Prefer these Morocco-first company location queries when relevant:
+            {json.dumps(morocco_queries, ensure_ascii=False)}
 
             Return ONLY a JSON array of query strings, nothing else.
             Example: ["Acme Corp Paris address phone", "John Doe Acme Corp email title"]
@@ -204,13 +235,14 @@ class CrmLead(models.Model):
             temperature=0.0,
         )
         if resp is None:
-            return []
+            return morocco_queries
         try:
             queries = json.loads(self._strip_markdown(resp))
-            return [q for q in queries if isinstance(q, str) and q.strip()][:5]
+            planned_queries = [q for q in queries if isinstance(q, str) and q.strip()][:5]
+            return self._merge_queries(morocco_queries, planned_queries)
         except (json.JSONDecodeError, TypeError):
             _logger.error("Query planner returned invalid JSON: %s", resp)
-            return []
+            return morocco_queries
 
     # ------------------------------------------------------------------
     # Stage 2 — Parallel Tavily searches
@@ -301,6 +333,47 @@ class CrmLead(models.Model):
             _logger.error("Extractor returned invalid JSON: %s", raw)
             return None
 
+    def _infer_company_name_from_contact(
+        self,
+        contact_name: str,
+        contact_email_hint: str,
+        city_hint: str,
+        groq_key: str,
+        tavily_key: str,
+    ) -> str | None:
+        if not contact_name:
+            return None
+
+        queries = self._company_inference_queries(
+            contact_name=contact_name,
+            contact_email_hint=contact_email_hint,
+            city_hint=city_hint,
+        )
+        if not queries:
+            return None
+
+        raw_results = self._parallel_search(queries, tavily_key)
+        if not raw_results:
+            return None
+
+        extracted = self._extract_fields(
+            search_blob=raw_results,
+            fields={"company_name": "current employer or company name"},
+            company_name="",
+            contact_name=contact_name,
+            contact_email_hint=contact_email_hint,
+            groq_key=groq_key,
+            source_type="contact",
+        )
+        if not extracted:
+            return None
+
+        company_name = extracted.get("company_name")
+        if isinstance(company_name, str):
+            company_name = company_name.strip()
+            return company_name or None
+        return None
+
     # ------------------------------------------------------------------
     # Shared Groq helper
     # ------------------------------------------------------------------
@@ -380,6 +453,66 @@ class CrmLead(models.Model):
                 parts.append(f"{header}\n{content}")
         return "\n\n".join(parts)
 
+    @staticmethod
+    def _company_inference_queries(
+        contact_name: str,
+        contact_email_hint: str = "",
+        city_hint: str = "",
+    ) -> list[str]:
+        if not contact_name:
+            return []
+
+        queries = [
+            f'"{contact_name}" company',
+            f'"{contact_name}" works at',
+            f'"{contact_name}" employer',
+        ]
+        if city_hint:
+            queries.append(f'"{contact_name}" {city_hint} company')
+        if contact_email_hint and "@" in contact_email_hint:
+            domain = contact_email_hint.split("@", 1)[1].strip()
+            if domain:
+                queries.append(f'"{contact_name}" {domain}')
+
+        deduped_queries = []
+        for query in queries:
+            query = query.strip()
+            if query and query not in deduped_queries:
+                deduped_queries.append(query)
+        return deduped_queries[:5]
+
+    @staticmethod
+    def _morocco_company_location_queries(
+        company_name: str,
+        company_fields: list,
+        city_hint: str = "",
+    ) -> list[str]:
+        if not company_name or not any(field in {"street", "city"} for field in company_fields):
+            return []
+
+        queries = [
+            f"{company_name} Morocco address",
+            f"{company_name} Morocco city",
+            f"{company_name} Morocco office address",
+        ]
+        if city_hint:
+            queries.insert(1, f"{company_name} {city_hint} Morocco address")
+
+        deduped_queries = []
+        for query in queries:
+            query = query.strip()
+            if query and query not in deduped_queries:
+                deduped_queries.append(query)
+        return deduped_queries[:5]
+
+    @staticmethod
+    def _merge_queries(priority_queries: list[str], planned_queries: list[str]) -> list[str]:
+        merged = []
+        for query in priority_queries + planned_queries:
+            if query and query not in merged:
+                merged.append(query)
+        return merged[:5]
+
     # ------------------------------------------------------------------
     # Field helpers
     # ------------------------------------------------------------------
@@ -427,6 +560,7 @@ class CrmLead(models.Model):
 
     def _apply_extracted_data(self, data: dict, company_name: str = "", write_phone: bool = True):
         mapping = {
+            "company_name": "partner_name",
             "street": "street", "street2": "street2", "zip": "zip",
             "city": "city", "website": "website",
             "function": "function",
