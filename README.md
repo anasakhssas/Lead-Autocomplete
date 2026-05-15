@@ -40,10 +40,6 @@ Dans les paramètres Odoo, renseignez les clés API suivantes :
 2. Cliquez sur **Auto-fill**.
 3. Vérifiez les champs proposés avant de sauvegarder.
 
-## Remarque
-
-Le but n'est pas de tout remplir automatiquement à n'importe quel prix. Le module aide surtout à démarrer plus vite, puis l'utilisateur garde la main pour valider ou corriger les données.
-
 ## Dépendances
 
 - `crm`
